@@ -162,7 +162,7 @@ class LoraModel(torch.nn.Module):
                         kwargs.update({"enable_lora": self.peft_config.enable_lora})
                         new_module = MergedLinear8bitLt(target.in_features, target.out_features, bias=bias, **kwargs)
                 elif isinstance(target, torch.nn.Linear) and self.peft_config.enable_lora is None:
-                    new_module = Linear(target.in_features, target.out_features, bias=bias, **kwargs)
+                    new_module = LoRA(target.in_features, target.out_features, True, 1024, 16, bias=bias, **kwargs)
                 elif self.peft_config.enable_lora is not None:
                     kwargs.update({"enable_lora": self.peft_config.enable_lora})
                     if isinstance(target, Conv1D):
@@ -622,3 +622,118 @@ if is_bnb_available():
                     output = self.zero_pad(after_B) * self.scaling
                     result += output
             return result
+
+class GenerateParams(torch.autograd.Function):
+    # Generate parameters on the fly with random basis
+    
+    @staticmethod    
+    def forward(ctx, coefficients, out_dim, in_dim, seed): 
+        num_basis = coefficients.shape[0]
+        Out = torch.zeros(out_dim, in_dim).to(coefficients.device)
+        rand_seed = torch.randint(int(1e10), (1,))
+        torch.manual_seed(seed)
+        
+        W = torch.zeros(num_basis, out_dim, in_dim, 
+                        device=coefficients.device, dtype=coefficients.dtype)
+        nn.init.uniform_(W, a=-1.0, b=1.0)
+        Out = torch.einsum('b,boi->oi', coefficients, W)
+        
+        params = torch.autograd.Variable(torch.tensor([out_dim, in_dim, seed]))
+        ctx.save_for_backward(coefficients, params)
+        torch.manual_seed(rand_seed)
+        return Out 
+    
+    @staticmethod
+    def backward(ctx, grad_output):
+        coefficients, params = ctx.saved_tensors
+        num_basis = coefficients.shape[0]
+
+        out_dim, in_dim, seed = params
+        rand_seed = torch.randint(int(1e10), (1,))
+        torch.manual_seed(seed)
+        grad_coefficients = torch.empty(0).to(grad_output.device)
+
+        W = torch.zeros(num_basis, out_dim, in_dim, 
+                        device=coefficients.device, dtype=coefficients.dtype)
+        nn.init.uniform_(W, a=-1.0, b=1.0) 
+        W = W.permute(1,2,0).reshape(-1, num_basis)
+        grad_coefficients = torch.einsum('d,dl->l', grad_output.flatten(), W)
+
+        torch.manual_seed(rand_seed)    
+        return grad_coefficients , None, None, None
+    
+class NOLALinear(nn.Linear): 
+    # NOLA Linear Layer 
+    
+    def __init__(
+        self, 
+        in_features: int, 
+        out_features: int, 
+        num_basis = 256, 
+        **kwargs):
+        
+        nn.Linear.__init__(self, in_features, out_features, **kwargs)
+        self.num_basis = num_basis 
+        self.generate_params = GenerateParams.apply
+        self.seed = nn.Parameter(torch.randint(int(1e10), (1,)), requires_grad=False)
+        self.coefficients = nn.Parameter(torch.zeros(num_basis), requires_grad=True)
+        self.weight.requires_grad = False
+        
+    def extra_repr(self) -> str:
+        return 'in_features={}, out_features={}, num_basis={}'.format(
+            self.in_features, self.out_features, self.num_basis)  
+
+    def forward(self, x: torch.Tensor):
+        W = self.generate_params(self.coefficients,
+                          self.out_features,
+                          self.in_features,
+                          self.seed) + self.weight
+        return x @ W.t()
+
+ 
+class LoRA(nn.Module):
+    # LoRA with NOLA, implementation of a dense layer
+    def __init__(
+        self, 
+        in_features: int, 
+        out_features: int, 
+        use_nola = False,
+        num_basis = 1024, 
+        rank=16, 
+        alpha = 1.0, 
+        **kwargs
+    ):
+        super(LoRA, self).__init__(**kwargs)
+        self.in_features = in_features
+        self.out_features = out_features
+        self.num_basis_A = num_basis
+        self.num_basis_B = num_basis
+        self.rank = rank
+        self.alpha = alpha 
+        self.scale = self.alpha / self.rank
+        self.generate_params = GenerateParams.apply
+        self.use_nola = use_nola 
+        
+        if use_nola: 
+            self.lora_A = NOLALinear(in_features, rank, num_basis=self.num_basis_A, bias=False)
+            self.lora_B = NOLALinear(rank, out_features, num_basis=self.num_basis_B, bias=False)
+        else:
+            self.lora_A = nn.Linear(in_features, rank, bias=False)
+            self.lora_B = nn.Linear(rank, out_features, bias=False)
+        self.reset_lora_parameters()
+        
+    def extra_repr(self) -> str:
+        return 'NOLA: rank={}, in_features={}, out_features={}, num_basis_A={}, num_basis_B={}'.format(
+            self.rank, self.in_features, self.out_features, self.num_basis_A, self.num_basis_B)
+
+    def reset_lora_parameters(self):        
+        if self.use_nola: 
+            nn.init.zeros_(self.lora_A.coefficients)
+            nn.init.zeros_(self.lora_B.coefficients)
+            
+        # initialize A the same way as the default for nn.Linear and B to zero
+        nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
+        nn.init.zeros_(self.lora_B.weight)
+
+    def forward(self, x: torch.Tensor):
+        return self.lora_B(self.lora_A(x)) * self.scale

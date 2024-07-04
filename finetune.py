@@ -16,11 +16,11 @@ import bitsandbytes as bnb
 sys.path.append(os.path.join(os.getcwd(), "peft/src/"))
 from peft import (  # noqa: E402
     LoraConfig,
-    BottleneckConfig,
+    # BottleneckConfig,
     PrefixTuningConfig,
     get_peft_model,
     get_peft_model_state_dict,
-    prepare_model_for_int8_training,
+    # prepare_model_for_int8_training,
     set_peft_model_state_dict,
 )
 from transformers import AutoModelForCausalLM, AutoTokenizer, LlamaTokenizer, AutoModel  # noqa: F402
